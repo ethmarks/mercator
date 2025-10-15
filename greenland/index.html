@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<!-- Vibe-coded with Claude Sonnet 4 -->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Greenland Distortion</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+
+        #map {
+            height: 100vh;
+            width: 100vw;
+        }
+
+        .greenland-shape {
+            fill: #2e7d32;
+            fill-opacity: 0.7;
+            stroke: #1b5e20;
+            stroke-width: 2;
+            cursor: move;
+        }
+
+        .greenland-shape:hover {
+            fill-opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://unpkg.com/topojson@3"></script>
+    <script>
+        // Initialize the map
+        const map = L.map('map', {
+            center: [70, -40],
+            zoom: 3,
+            minZoom: 2,
+            maxZoom: 10
+        });
+
+        // Add OpenStreetMap tiles
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        let greenlandPolygon = null;
+        let isDragging = false;
+        let dragOffset = { lat: 0, lng: 0 };
+        let originalGreenlandGeo = null;
+
+        // Create base projections
+        const baseProjection = d3.geoMercator()
+            .scale(1)
+            .translate([0, 0]);
+
+        function createProjectionForLatitude(centerLat, centerLng) {
+            return d3.geoMercator()
+                .center([centerLng, centerLat])
+                .scale(1)
+                .translate([0, 0]);
+        }
+
+        // Function to get centroid of polygon
+        function getPolygonCentroid(coords) {
+            let latSum = 0, lngSum = 0, count = 0;
+
+            function processCoords(coordArray) {
+                for (const coord of coordArray) {
+                    if (Array.isArray(coord[0])) {
+                        processCoords(coord);
+                    } else {
+                        latSum += coord[0];
+                        lngSum += coord[1];
+                        count++;
+                    }
+                }
+            }
+
+            processCoords(coords);
+            return [latSum / count, lngSum / count];
+        }
+
+        // Function to scale and translate Greenland
+        function transformGreenland(newCenterLat, newCenterLng) {
+            if (!originalGreenlandGeo) return null;
+
+            // Create projections for original and new positions
+            const originalProjection = createProjectionForLatitude(72, -40); // Greenland's actual position
+            const newProjection = createProjectionForLatitude(newCenterLat, newCenterLng);
+
+            // Calculate scale difference between projections
+            const originalScale = originalProjection.scale() / Math.cos(72 * Math.PI / 180);
+            const newScale = newProjection.scale() / Math.cos(newCenterLat * Math.PI / 180);
+            const scaleFactor = newScale / originalScale;
+
+            const originalCenter = getPolygonCentroid(originalGreenlandGeo);
+            const [origCenterLat, origCenterLng] = originalCenter;
+
+            function transformCoords(coords) {
+                if (Array.isArray(coords[0][0])) {
+                    return coords.map(transformCoords);
+                }
+
+                return coords.map(coord => {
+                    const [lat, lng] = coord;
+
+                    // Project to planar coordinates
+                    const originalPoint = originalProjection([lng, lat]);
+                    const centerPoint = originalProjection([origCenterLng, origCenterLat]);
+
+                    if (!originalPoint || !centerPoint) return coord;
+
+                    // Scale relative to center
+                    const scaledX = centerPoint[0] + (originalPoint[0] - centerPoint[0]) * scaleFactor;
+                    const scaledY = centerPoint[1] + (originalPoint[1] - centerPoint[1]) * scaleFactor;
+
+                    // Project back to geographic coordinates at new position
+                    const newCenterPoint = newProjection([newCenterLng, newCenterLat]);
+                    if (!newCenterPoint) return coord;
+
+                    const translatedX = scaledX - centerPoint[0] + newCenterPoint[0];
+                    const translatedY = scaledY - centerPoint[1] + newCenterPoint[1];
+
+                    const newGeoCoord = newProjection.invert([translatedX, translatedY]);
+
+                    return newGeoCoord ? [newGeoCoord[1], newGeoCoord[0]] : coord; // [lat, lng]
+                });
+            }
+
+            return transformCoords(originalGreenlandGeo);
+        }
+
+        // Mouse/touch event handlers
+        function onMouseDown(e) {
+            if (!greenlandPolygon) return;
+            isDragging = true;
+            const center = greenlandPolygon.getBounds().getCenter();
+            dragOffset.lat = e.latlng.lat - center.lat;
+            dragOffset.lng = e.latlng.lng - center.lng;
+            map.dragging.disable();
+            e.originalEvent.preventDefault();
+        }
+
+        function onMouseMove(e) {
+            if (!isDragging || !greenlandPolygon) return;
+
+            const newCenterLat = e.latlng.lat - dragOffset.lat;
+            const newCenterLng = e.latlng.lng - dragOffset.lng;
+
+            // Constrain latitude to reasonable bounds
+            const constrainedLat = Math.max(-80, Math.min(85, newCenterLat));
+
+            // Update Greenland position and scale
+            const newCoords = transformGreenland(constrainedLat, newCenterLng);
+            if (newCoords) {
+                greenlandPolygon.setLatLngs(newCoords);
+            }
+        }
+
+        function onMouseUp(e) {
+            if (isDragging) {
+                isDragging = false;
+                map.dragging.enable();
+            }
+        }
+
+        // Load world data and extract Greenland
+        async function loadGreenland() {
+            try {
+                // Use Natural Earth data from CDN
+                const response = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json');
+                const world = await response.json();
+
+                // Convert TopoJSON to GeoJSON
+                const countries = topojson.feature(world, world.objects.countries);
+
+                // Find Greenland (Denmark, which includes Greenland)
+                // Greenland typically has a large area, so we'll find the largest polygon
+                let greenlandFeature = null;
+                let maxArea = 0;
+
+                countries.features.forEach(feature => {
+                    // Look for features that could be Greenland based on position and size
+                    if (feature.geometry && feature.geometry.coordinates) {
+                        const bounds = d3.geoBounds(feature);
+                        const [[west, south], [east, north]] = bounds;
+
+                        // Greenland is roughly between 60-84°N and 10-75°W
+                        if (west < -10 && east > -75 && north > 80 && south > 60) {
+                            const area = d3.geoArea(feature);
+                            if (area > maxArea) {
+                                maxArea = area;
+                                greenlandFeature = feature;
+                            }
+                        }
+                    }
+                });
+
+                if (greenlandFeature) {
+                    // Convert to Leaflet format [lat, lng]
+                    function convertCoords(coords) {
+                        if (Array.isArray(coords[0][0])) {
+                            return coords.map(convertCoords);
+                        }
+                        return coords.map(coord => [coord[1], coord[0]]); // [lng, lat] -> [lat, lng]
+                    }
+
+                    const leafletCoords = convertCoords(greenlandFeature.geometry.coordinates);
+                    originalGreenlandGeo = leafletCoords;
+
+                    // Create the Greenland polygon
+                    greenlandPolygon = L.polygon(leafletCoords, {
+                        className: 'greenland-shape'
+                    }).addTo(map);
+
+                    // Add event listeners
+                    greenlandPolygon.on('mousedown', onMouseDown);
+                    map.on('mousemove', onMouseMove);
+                    map.on('mouseup', onMouseUp);
+
+                    // Touch events for mobile
+                    greenlandPolygon.on('touchstart', function(e) {
+                        e.originalEvent.preventDefault();
+                        const touch = e.originalEvent.touches[0];
+                        const fakeEvent = {
+                            latlng: map.mouseEventToLatLng(touch),
+                            originalEvent: e.originalEvent
+                        };
+                        onMouseDown(fakeEvent);
+                    });
+
+                    map.on('touchmove', function(e) {
+                        if (!isDragging) return;
+                        e.originalEvent.preventDefault();
+                        const touch = e.originalEvent.touches[0];
+                        const fakeEvent = {
+                            latlng: map.mouseEventToLatLng(touch)
+                        };
+                        onMouseMove(fakeEvent);
+                    });
+
+                    map.on('touchend', onMouseUp);
+
+                    // Prevent context menu
+                    greenlandPolygon.on('contextmenu', function(e) {
+                        e.originalEvent.preventDefault();
+                    });
+
+                } else {
+                    console.error('Could not find Greenland in the data');
+                }
+
+            } catch (error) {
+                console.error('Error loading geographic data:', error);
+            }
+        }
+
+        // Load Greenland data when page loads
+        loadGreenland();
+    </script>
+</body>
+</html>
